@@ -1,6 +1,9 @@
 # Data
 data/trajectories/
 
+# Model checkpoints
+*.pt
+
 # Nested repos
 week5/le-wm/
 
