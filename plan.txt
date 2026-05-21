@@ -1,0 +1,163 @@
+Good engineering instinct — building the harness before the science is exactly the right order. Most robotics projects fail not because the algorithm is wrong but because someone tried to debug a learned policy through a flaky camera driver on week 5. Get the boring stuff bulletproof first.
+
+Here's the plan. I'm structuring it as an eight-week schedule with explicit "kill criteria" — concrete checkpoints where if you can't pass, you stop and fix the foundation before moving on. Robotics projects without these turn into death marches.
+
+## Overall philosophy
+
+Three principles that should guide the whole project:
+
+**Vertical slice first, then deepen.** Get a crappy end-to-end version working by week 3 — pre-trained policy walking in Isaac Sim, dummy navigation, basic SDK plumbing. Then improve each layer. Don't build the perfect locomotion first; you need to know the whole pipeline shape before you optimize any part.
+
+**One simulator at a time.** You're going to be tempted to bounce between Isaac Sim, Isaac Lab, MuJoCo, and Gazebo. Don't. Pick one for each layer and stay there. My recommendation: **Isaac Lab for RL training, `unitree_mujoco` for SDK validation, Isaac Sim for the final visual demo.**
+
+**Log everything from day one.** TensorBoard for training metrics, rosbag (or equivalent) for runtime data, screenshot/video everything. When something breaks in week 6 you'll want week-2 baselines to compare against.
+
+## Week 0 — Environment setup (do this BEFORE week 1 starts)
+
+Treat this as a separate weekend before the project officially begins. Setup is the #1 cause of robotics project schedule slippage and you don't want it eating real project time.
+
+**Hardware/OS checklist.** Ubuntu 22.04 native (not WSL — Isaac Sim is painful on WSL). NVIDIA driver ≥535. CUDA 12.x. Confirm your 16 GB GPU shows up in `nvidia-smi`. Install conda/mamba.
+
+**Install the stack in this order, verifying each before moving to the next:**
+
+1. Isaac Sim 4.x — get it running, open the empty scene, verify you can see it render at >20 FPS
+2. Isaac Lab — clone the repo, run their stock `Isaac-Velocity-Flat-Unitree-Go2-v0` task with `--headless` and confirm training starts and reward goes up for 100 iterations
+3. `unitree_rl_lab` — install on top of Isaac Lab, run their Go2 velocity task, confirm it trains
+4. `unitree_mujoco` — install separately, run a basic stand-up demo
+5. `unitree_sdk2` — clone, build the C++ examples (`stand_example`, `velocity_example`), confirm they compile
+
+**Kill criterion for Week 0:** all five steps complete with a screenshot/log of each working. If any step takes more than a day to fix, that's your warning that GPU/driver/OS is wrong and you need to address it before proceeding.
+
+Common gotchas you'll hit: Isaac Sim's "RTX renderer not available" (driver issue), Isaac Lab Python version mismatch (it wants 3.10), `unitree_rl_lab` expects a specific Isaac Lab version (check the README — it's usually pinned to a tag).
+
+## Week 1 — SDK and simulator plumbing (no learning yet)
+
+This week is entirely about proving you can move bytes between the right places. No RL, no policies, no perception.
+
+**Day 1–2: SDK control of MuJoCo robot.** Write a small Python script that uses `unitree_sdk2_python` to send a velocity command (`0.5 m/s forward`) to a Go2 in `unitree_mujoco`. The robot should walk. This validates the entire SDK ↔ simulator path. Save this script — you'll reuse it for every subsequent test.
+
+**Day 3: Camera streaming.** Spawn a Go2 in Isaac Sim with a camera attached to its head. Stream the RGB image into a Python process — Isaac Sim has a built-in API for this via the Replicator or the standalone camera sensor. Display the live image in an OpenCV window. Save 100 frames to disk. Confirm timestamps are reasonable.
+
+**Day 4: Sim-to-script telemetry.** Same as the camera but for robot state — base pose, joint positions, IMU. You're building the equivalent of a ROS2 subscriber that gets the robot's full state at ~50 Hz.
+
+**Day 5–6: Closed loop test.** Write a dumb open-loop controller: "drive forward 3 seconds, turn left 2 seconds, repeat." Run it through the SDK against `unitree_mujoco`. Log everything. Replay the logs and verify the robot did what you commanded. This is your basic logging and replay infrastructure — it will save you dozens of hours later.
+
+**Kill criterion for Week 1:** you can spawn the robot, command it via SDK, read camera and state telemetry, log a run, and replay/analyze it offline. If you can't do this, **stop and fix it before week 2.** I cannot stress this enough — moving forward with a flaky telemetry pipeline is how robotics projects die.
+
+**Debugging mindset for this week:** Almost everything that goes wrong is either a coordinate-frame mismatch (someone's z-up vs y-up), a unit mismatch (degrees vs radians, or mm vs m), or a timing mismatch (controller running too fast for sim). Print *everything* with units in the variable name (`vel_x_mps`, `yaw_rad`) and you'll catch 80% of these.
+
+## Week 2 — Stock RL policy deployment
+
+Now use what other people built. The goal is to run Unitree's pre-trained Go2 velocity policy end-to-end without training anything yourself.
+
+**Day 1–2: Run the stock checkpoint.** `unitree_rl_lab` ships with trained checkpoints. Load one, run inference, drive a Go2 in Isaac Sim. Confirm it walks when you send velocity commands.
+
+**Day 3: ONNX export and verification.** Export the policy to ONNX (the `unitree_rl_lab` deployment scripts do this). Load the ONNX in Python, send it observations from `unitree_mujoco`, get actions, send to SDK. Confirm the MuJoCo robot also walks. This is your sim-to-sim transfer — it proves the policy is portable.
+
+**Day 4–5: Vertical slice.** Now wire everything together: Isaac Sim camera → save image (not used yet) → stock policy → SDK → robot moves. Even though the camera isn't doing anything, the *plumbing* is now end-to-end. You have a complete loop you can extend.
+
+**Day 6–7: Buffer / catch-up day.** Anything that didn't work, fix now.
+
+**Kill criterion for Week 2:** trained Unitree policy moves the robot in both Isaac Sim and `unitree_mujoco`, with you in control of high-level velocity commands.
+
+## Week 3 — Terrain and payload (the RL contribution)
+
+Now you start training. Take the stock policy and fine-tune it for your scenario.
+
+**Day 1–2: Terrain setup.** In Isaac Lab, modify the Go2 environment config to include sloped terrain (Isaac Lab has built-in terrain generators — pyramids, slopes, rough). Start with shallow slopes (5–10°), nothing fancy.
+
+**Day 3–4: Payload randomization.** Add a randomized payload to the Go2's torso in the URDF/USD — mass between 0–8 kg, position offset random within ±10 cm. This is what makes your policy "bamboo-carrying-relevant."
+
+**Day 5–6: Fine-tune training.** Initialize from the stock checkpoint, train for ~500–1000 iterations with the new terrain and payload config. Should fit in 16 GB if you reduce `num_envs` from the default 4096 to 1024 or 2048. Training time: maybe 2–4 hours.
+
+**Day 7: Evaluation and comparison.** Roll out both policies (stock vs fine-tuned) on sloped terrain with payload. Measure: success rate (didn't fall), mean velocity error, energy use. Make a comparison video.
+
+**Kill criterion for Week 3:** fine-tuned policy demonstrably outperforms the stock policy on sloped + loaded terrain. If it doesn't, your reward function needs work — most likely you need a slope-aware orientation term or a payload-aware foot-contact term. Don't proceed without this win.
+
+**Debugging warning:** RL training fails silently. The reward will look like it's going up but the policy may be exploiting the reward in a stupid way (e.g., walking with one foot dragging because it minimizes energy). *Always* watch the rendered behavior, not just the curves. Set up Isaac Lab to render one of your parallel environments to a window so you can eyeball gait quality during training.
+
+## Week 4 — Data collection for LeWM
+
+This is the dullest week but it's critical. World models are only as good as their training data.
+
+**Day 1–2: Trajectory collection script.** Write a script that spawns the Go2 in Isaac Sim, with a forest-ish scene (you can place cylinder "trees" procedurally — bamboo doesn't have to look pretty), and records 30-second trajectories: front camera RGB image at 10 Hz + the velocity commands you sent. Save as `.npz` or `.h5`.
+
+**Day 3–5: Collect 100–200 trajectories.** Vary the start position, terrain layout, obstacle density, and commanded paths. Mix scripted policies (forward + occasional turns) with some manual joystick-style commands. This dataset will be ~10–20 GB.
+
+**Day 6–7: Data inspection.** Visualize trajectories. Check for corrupted frames, weird actions, robot-fell-over episodes you should drop. Build a quick browser tool — even just a Jupyter notebook that lets you scrub through episodes. **This is the most overlooked step.** Bad data is the #1 reason world models fail and you cannot diagnose it later.
+
+**Kill criterion for Week 4:** clean dataset of ≥150 trajectories, each verified visually, with consistent action/observation alignment.
+
+## Week 5 — Train LeWM
+
+**Day 1–2: Implementation setup.** Clone the LeWM reference code (when available — if not yet released, you may need to reimplement from the paper, which is doable since it's only ~15M parameters and the architecture is small). Get it training on the LeWM authors' demo data first, just to confirm your setup works.
+
+**Day 3–5: Train on your Go2 data.** Adapt the data loader for your trajectory format. Train end-to-end. With 15M parameters this trains in a few hours on your 16 GB GPU. Monitor the prediction loss and the SIGReg regularizer term — both should converge.
+
+**Day 6–7: Evaluate the world model.** Test the planner: encode a start image + goal image from a held-out trajectory, run CEM, see if the predicted action sequence is reasonable. Visualize the rolled-out latent embeddings if you can. This is where you find out if your dataset was good enough.
+
+**Kill criterion for Week 5:** LeWM converges on your data, and CEM planning produces action sequences that are *qualitatively* sensible — not necessarily perfect, but not random noise. If the planner outputs garbage, the issue is almost always data quality (week 4) or action normalization, *not* the model. Don't try to fix it by training longer.
+
+**Realistic expectation:** LeWM was demonstrated on simple planar tasks in the paper, not on quadruped navigation. Your version may be the first attempt at this. Expect lower performance than the paper's reported numbers — this is fine and is part of the honest story you'll tell about the project.
+
+## Week 6 — Integration
+
+Wire LeWM (high-level planner) → RL policy (low-level controller) → SDK → robot.
+
+**Day 1–2: Architecture.** LeWM outputs a planned action sequence at low frequency (~1 Hz). The RL policy needs velocity commands at ~50 Hz. Build the bridge: LeWM plans every 1 second, outputs `(vx, vy, ω)` for the next ~10 timesteps, you stream these to the RL policy as it runs. Test this in `unitree_mujoco` first because it's lighter weight than Isaac Sim.
+
+**Day 3–4: Full loop in Isaac Sim.** Spawn Go2 in the bamboo-forest scene. Take a start camera image. Pick a goal image (a saved photo of "downhill at the bottom"). Run the loop: encode, plan, execute, observe, replan. Robot should make progress toward the goal.
+
+**Day 5–7: Iterate and debug.** Things that will go wrong: the world model thinks the robot can move faster than it can, the low-level policy doesn't track high-level commands accurately enough on slopes, the planner gets stuck in local minima. For each, log carefully and fix incrementally. **Have a baseline of "no LeWM, just blind forward + obstacle avoidance"** so you can demonstrate value-added.
+
+**Kill criterion for Week 6:** robot navigates from start to goal across at least 3 of 5 test runs, with the world-model planner clearly influencing direction (compare against blind baseline).
+
+**This is the week most likely to slip.** Plan for it. If by day 5 it's not working, scope down: show LeWM working in *prediction* mode (give it a start and an action sequence, show its predicted trajectory matches reality), even without closed-loop planning. That's still a valid result.
+
+## Week 7 — Demo polish and client packaging
+
+Time to make it presentable.
+
+**Day 1–2: WebXR viewer.** Three.js + A-Frame web page showing the robot's trajectory, the world model's predicted future path overlaid on the real one, and a "spawn obstacle" button to demo robustness. Hosted on GitHub Pages.
+
+**Day 3: Demo video.** 3-minute walkthrough with voiceover. Practice the narration twice before recording.
+
+**Day 4: One-page client brief.** Plain English, no jargon. "What problem this solves, what the demo shows, what real deployment requires." Target audience: a non-technical executive.
+
+**Day 5: Slide deck.** 8–10 slides framed as an EY-style innovation workshop intro. Problem space, current state of art, where this fits, deployment roadmap.
+
+**Day 6: GitHub README.** Architecture diagram, install instructions, results, video link, paper references. Make it look like a real research project, not a class assignment.
+
+**Day 7: Buffer.**
+
+## Week 8 — Buffer / extensions
+
+Real project schedules need buffer. If everything is on track, use this week for stretch goals: real-world dataset (if you have access to any), additional terrain types, comparison against a non-learned baseline. If things slipped, this is your recovery week.
+
+## Risk register — the things that will actually bite
+
+Worth pre-mortem'ing because forewarned is half-debugged:
+
+**Week 0 GPU/driver hell.** Probability: 40%. Mitigation: do it on a Friday so you have the weekend, and have a cloud GPU rental account (RunPod, Vast.ai) ready as a fallback. A 4090 instance for a week costs ~$70.
+
+**Isaac Lab API breakage.** Isaac Lab moves fast and `unitree_rl_lab` may pin to a specific version. Probability: 60%. Mitigation: when you find a working combination, *write down the exact commits/versions* and don't update during the project.
+
+**LeWM doesn't generalize to quadruped data.** Probability: 30%. Mitigation: have the fallback (locomotion-only project) clearly defined so you can ship that if needed.
+
+**Time on weeks 5–6 doubles.** Probability: 70%. Mitigation: that's why there's a week 8 buffer.
+
+**You discover a fundamental misconception about how something works (e.g., what "actions" LeWM consumes vs what your policy outputs).** Probability: 90%. Mitigation: design the integration interfaces in week 1 on paper, before you've committed code, so you can spot the misunderstanding before it costs you implementation time.
+
+## What you'll have at the end
+
+A GitHub repo, a hosted WebXR demo URL, a 3-minute video, a one-page client brief, an 8-slide deck, and three CV bullets that read like senior work:
+
+*"Trained reinforcement learning locomotion policy for Unitree Go2 on slope and payload-randomized terrain in Isaac Lab; deployed via Unitree SDK2 with sim-to-sim validation in MuJoCo."*
+
+*"Adapted LeWorldModel (LeCun et al., 2026) JEPA-based world model for vision-based navigation planning on quadruped robots; integrated with low-level RL policy via hierarchical control."*
+
+*"Framed and demonstrated the system around steep-terrain agricultural transport, a real-world application in forestry, mining, and construction inspection."*
+
+That's a single coherent project that pulls in everything EY's job description asked for and pushes the frontier on the LeWM side. Plenty to talk about in interviews.
+
+Want me to go deeper on any specific week — the SDK + camera plumbing in week 1 is the part most people botch and is worth detailed walkthrough, or the LeWM data collection script in week 4 is the part that determines whether everything works?

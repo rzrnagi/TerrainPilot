@@ -1,0 +1,11 @@
+# Data
+data/trajectories/
+
+# Nested repos
+week5/le-wm/
+
+# Generated outputs
+__pycache__/
+*.pyc
+week5/outputs/
+week5/logs/
